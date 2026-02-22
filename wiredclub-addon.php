@@ -181,6 +181,38 @@ register_activation_hook(__FILE__, function () {
 });
 
 // ==============================
+// Posts privados para admins via JWT
+// ==============================
+
+// 1) Reconhece o usuário WP do JWT como logado (necessário para is_user_logged_in() retornar true)
+add_filter('determine_current_user', function ($user_id) {
+    if ($user_id) return $user_id;
+    $payload = wiredclub_verify_jwt();
+    if ($payload && !empty($payload['isAdmin']) && !empty($payload['wpUserId'])) {
+        return (int) $payload['wpUserId'];
+    }
+    return $user_id;
+});
+
+// 2) Concede a capability read_private_posts a admins JWT
+add_filter('user_has_cap', function ($allcaps, $caps, $args, $user) {
+    $payload = wiredclub_verify_jwt();
+    if ($payload && !empty($payload['isAdmin'])) {
+        $allcaps['read_private_posts'] = true;
+    }
+    return $allcaps;
+}, 10, 4);
+
+// 3) Inclui posts privados na WP_Query do endpoint REST para admins JWT
+add_filter('rest_post_query', function (array $args, WP_REST_Request $request): array {
+    $payload = wiredclub_verify_jwt();
+    if ($payload && !empty($payload['isAdmin'])) {
+        $args['post_status'] = ['publish', 'private'];
+    }
+    return $args;
+}, 10, 2);
+
+// ==============================
 // REST API
 // ==============================
 
@@ -348,7 +380,7 @@ add_action('rest_api_init', function () {
                 'nickname' => [
                     'required'          => true,
                     'type'              => 'string',
-                    'sanitize_callback' => 'sanitize_user',
+                    'sanitize_callback' => 'sanitize_text_field',
                 ],
             ],
         ],
@@ -378,7 +410,7 @@ add_action('rest_api_init', function () {
         ],
     ]);
 
-    register_rest_route('wp/v2', '/wiredclub/players/(?P<nickname>[a-zA-Z0-9_\-\.]+)', [
+    register_rest_route('wp/v2', '/wiredclub/players/(?P<nickname>[^/]+)', [
         'methods'             => WP_REST_Server::READABLE,
         'callback'            => 'wiredclub_get_player',
         'permission_callback' => '__return_true',
@@ -497,6 +529,16 @@ function wiredclub_register_player(WP_REST_Request $request): WP_REST_Response {
     $fake_email = sanitize_email(strtolower($nickname) . '@habbo.wiredclub.com');
     $random_password = wp_generate_password(32, true, true);
 
+    // Filtro temporário para preservar caracteres especiais do nickname Habbo
+    // (wp_insert_user chama sanitize_user(strict=true) internamente, que strip vírgulas etc.)
+    $preserve_filter = function (string $sanitized, string $raw, bool $strict) use ($nickname): string {
+        if ($strict && $raw === $nickname) {
+            return $nickname;
+        }
+        return $sanitized;
+    };
+    add_filter('sanitize_user', $preserve_filter, PHP_INT_MAX, 3);
+
     $user_id = wp_insert_user([
         'user_login'   => $nickname,
         'user_pass'    => $random_password,
@@ -504,6 +546,8 @@ function wiredclub_register_player(WP_REST_Request $request): WP_REST_Response {
         'display_name' => $nickname,
         'role'         => 'subscriber',
     ]);
+
+    remove_filter('sanitize_user', $preserve_filter, PHP_INT_MAX);
 
     if (is_wp_error($user_id)) {
         return new WP_REST_Response([
@@ -588,7 +632,7 @@ function wiredclub_format_player(WP_User $user): array {
         'display_name'  => $user->display_name,
         'registered'    => mysql_to_rfc3339($user->user_registered),
         'avatar'        => 'https://www.habbo.com.br/habbo-imaging/avatarimage?img_format=png&user=' . urlencode($user->user_login) . '&direction=2&head_direction=2&size=l',
-        'is_admin'      => in_array('administrator', $user->roles, true),
+        'is_admin'      => !in_array('subscriber', $user->roles, true),
         'is_banned'     => wiredclub_is_banned($user->user_login),
     ];
 
@@ -803,14 +847,14 @@ function wiredclub_format_comment(WP_Comment $comment): array {
 
     if ($author_email) {
         $user = get_user_by('email', $author_email);
-        if ($user && in_array('administrator', $user->roles, true)) {
+        if ($user && !in_array('subscriber', $user->roles, true)) {
             $is_staff = true;
         }
     }
 
     if (!$user) {
         $user = get_user_by('login', $comment->comment_author);
-        if ($user && in_array('administrator', $user->roles, true)) {
+        if ($user && !in_array('subscriber', $user->roles, true)) {
             $is_staff = true;
         }
     }
@@ -1060,7 +1104,7 @@ function wiredclub_find_user_by_login(WP_REST_Request $request): WP_REST_Respons
         return new WP_REST_Response(['found' => false], 200);
     }
 
-    $is_admin = in_array('administrator', $user->roles, true);
+    $is_admin = !in_array('subscriber', $user->roles, true);
 
     return new WP_REST_Response([
         'found'    => true,
@@ -1076,14 +1120,14 @@ function wiredclub_check_is_admin(WP_REST_Request $request): WP_REST_Response {
     // Verificar por email (mesmo padrão dos comentários)
     $author_email = sanitize_email(strtolower($nickname) . '@habbo.wiredclub.com');
     $user = get_user_by('email', $author_email);
-    if ($user && in_array('administrator', $user->roles, true)) {
+    if ($user && !in_array('subscriber', $user->roles, true)) {
         $is_admin = true;
     }
 
     // Fallback: verificar por login
     if (!$is_admin) {
         $user = get_user_by('login', $nickname);
-        if ($user && in_array('administrator', $user->roles, true)) {
+        if ($user && !in_array('subscriber', $user->roles, true)) {
             $is_admin = true;
         }
     }
@@ -1263,6 +1307,58 @@ function wiredclub_player_has_badge(int $user_id, string $badge_id): bool {
 // ==============================
 // Admin - User Search AJAX
 // ==============================
+
+add_action('wp_ajax_wiredclub_get_badge_members', function () {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('Sem permissão.', 403);
+    }
+
+    $badge_id = sanitize_key($_GET['badge_id'] ?? '');
+    if (!$badge_id) {
+        wp_send_json_error('Badge ID inválido.', 400);
+    }
+
+    global $wpdb;
+    $pb_table = $wpdb->prefix . 'wiredclub_player_badges';
+
+    $rows = $wpdb->get_results($wpdb->prepare(
+        "SELECT user_id FROM $pb_table WHERE badge_id = %s ORDER BY granted_at DESC",
+        $badge_id
+    ));
+
+    $members = [];
+    foreach ($rows as $row) {
+        $user = get_userdata((int) $row->user_id);
+        if ($user) {
+            $members[] = [
+                'id'       => $user->ID,
+                'nickname' => $user->user_login,
+            ];
+        }
+    }
+
+    wp_send_json($members);
+});
+
+add_action('wp_ajax_wiredclub_revoke_badge_ajax', function () {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('Sem permissão.', 403);
+    }
+
+    if (!check_ajax_referer('wiredclub_badge_members_nonce', 'nonce', false)) {
+        wp_send_json_error('Nonce inválido.', 403);
+    }
+
+    $user_id  = absint($_POST['user_id'] ?? 0);
+    $badge_id = sanitize_key($_POST['badge_id'] ?? '');
+
+    if (!$user_id || !$badge_id) {
+        wp_send_json_error('Dados inválidos.', 400);
+    }
+
+    wiredclub_revoke_badge($user_id, $badge_id);
+    wp_send_json_success();
+});
 
 add_action('wp_ajax_wiredclub_search_users', function () {
     if (!current_user_can('manage_options')) {
@@ -1854,7 +1950,7 @@ function wiredclub_badges_content(): void {
                         <th>Nome</th>
                         <th>Attachment ID</th>
                         <th>Criado em</th>
-                        <th style="width:100px;">Ação</th>
+                        <th style="width:180px;">Ação</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -1874,7 +1970,12 @@ function wiredclub_badges_content(): void {
                             <td><?php echo $badge->attachment_id ?: '—'; ?></td>
                             <td><?php echo esc_html(date_i18n('d/m/Y H:i', strtotime($badge->created_at))); ?></td>
                             <td>
-                                <form method="post" style="display:inline;">
+                                <button type="button" class="button button-small wc-badge-members-btn"
+                                    data-badge-id="<?php echo esc_attr($badge->badge_id); ?>"
+                                    data-badge-name="<?php echo esc_attr($badge->name); ?>">
+                                    Membros
+                                </button>
+                                <form method="post" style="display:inline;margin-left:4px;">
                                     <?php wp_nonce_field('wiredclub_badges_action'); ?>
                                     <input type="hidden" name="wc_action" value="delete" />
                                     <input type="hidden" name="badge_id" value="<?php echo esc_attr($badge->badge_id); ?>" />
@@ -1888,6 +1989,17 @@ function wiredclub_badges_content(): void {
                 </tbody>
             </table>
         <?php endif; ?>
+
+    <!-- Modal de Membros do Emblema -->
+    <div id="wc-badge-members-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:100000;overflow-y:auto;">
+        <div style="background:#fff;margin:40px auto;max-width:640px;border-radius:4px;box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+            <div style="padding:16px 20px;border-bottom:1px solid #ddd;display:flex;justify-content:space-between;align-items:center;">
+                <h2 id="wc-badge-members-title" style="margin:0;font-size:15px;"></h2>
+                <button type="button" id="wc-badge-members-close" style="background:none;border:none;font-size:22px;cursor:pointer;line-height:1;color:#666;">&times;</button>
+            </div>
+            <div id="wc-badge-members-body" style="padding:20px;max-height:60vh;overflow-y:auto;"></div>
+        </div>
+    </div>
 
     <script>
     jQuery(document).ready(function($) {
@@ -1914,6 +2026,103 @@ function wiredclub_badges_content(): void {
             $('#attachment_id').val('0');
             $('#badge-image-preview').html('');
             $(this).hide();
+        });
+
+        // ---- Badge Members Modal ----
+        var ajaxUrl   = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
+        var membersNonce = <?php echo wp_json_encode(wp_create_nonce('wiredclub_badge_members_nonce')); ?>;
+        var $modal      = $('#wc-badge-members-modal');
+        var $modalTitle = $('#wc-badge-members-title');
+        var $modalBody  = $('#wc-badge-members-body');
+        var activeBadgeId   = '';
+        var activeBadgeName = '';
+
+        function escHtml(str) {
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function renderMembers(members) {
+            if (!members || !members.length) {
+                $modalBody.html('<p style="color:#999;">Nenhum jogador possui este emblema.</p>');
+                return;
+            }
+            var html = '<table class="wp-list-table widefat fixed striped">';
+            html += '<thead><tr><th style="width:50px;">Avatar</th><th>Nickname</th><th style="width:100px;">Ação</th></tr></thead><tbody>';
+            members.forEach(function(m) {
+                var avatar = 'https://www.habbo.com.br/habbo-imaging/avatarimage?img_format=png&user=' + encodeURIComponent(m.nickname) + '&direction=2&head_direction=2&size=s&headonly=1';
+                html += '<tr id="wc-mrow-' + m.id + '">';
+                html += '<td><img src="' + avatar + '" style="width:32px;height:32px;" /></td>';
+                html += '<td><strong>' + escHtml(m.nickname) + '</strong></td>';
+                html += '<td><button type="button" class="button button-small button-link-delete wc-revoke-member-btn"'
+                      + ' data-user-id="' + m.id + '" data-nickname="' + escHtml(m.nickname) + '">Excluir</button></td>';
+                html += '</tr>';
+            });
+            html += '</tbody></table>';
+            html += '<p style="margin-top:8px;color:#999;font-size:12px;">Total: ' + members.length + ' jogador(es)</p>';
+            $modalBody.html(html);
+        }
+
+        $(document).on('click', '.wc-badge-members-btn', function() {
+            activeBadgeId   = $(this).data('badge-id');
+            activeBadgeName = $(this).data('badge-name');
+            $modalTitle.text('Membros com o emblema: ' + activeBadgeName);
+            $modalBody.html('<p>Carregando...</p>');
+            $modal.show();
+
+            $.ajax({
+                url: ajaxUrl,
+                data: { action: 'wiredclub_get_badge_members', badge_id: activeBadgeId },
+                dataType: 'json',
+                success: function(data) { renderMembers(data); },
+                error: function() { $modalBody.html('<p style="color:red;">Erro ao carregar membros.</p>'); }
+            });
+        });
+
+        $('#wc-badge-members-close').on('click', function() { $modal.hide(); });
+        $modal.on('click', function(e) { if ($(e.target).is($modal)) $modal.hide(); });
+
+        $(document).on('click', '.wc-revoke-member-btn', function() {
+            var $btn     = $(this);
+            var userId   = $btn.data('user-id');
+            var nickname = $btn.data('nickname');
+
+            if (!confirm('Remover o emblema "' + activeBadgeName + '" de ' + nickname + '?')) return;
+
+            $btn.prop('disabled', true).text('Removendo...');
+
+            $.ajax({
+                url: ajaxUrl,
+                method: 'POST',
+                data: {
+                    action:   'wiredclub_revoke_badge_ajax',
+                    nonce:    membersNonce,
+                    user_id:  userId,
+                    badge_id: activeBadgeId,
+                },
+                dataType: 'json',
+                success: function(res) {
+                    if (res.success) {
+                        var $row = $('#wc-mrow-' + userId);
+                        $row.fadeOut(250, function() {
+                            $row.remove();
+                            if ($modalBody.find('tbody tr').length === 0) {
+                                $modalBody.html('<p style="color:#999;">Nenhum jogador possui este emblema.</p>');
+                            }
+                        });
+                    } else {
+                        $btn.prop('disabled', false).text('Excluir');
+                        alert('Erro ao remover emblema.');
+                    }
+                },
+                error: function() {
+                    $btn.prop('disabled', false).text('Excluir');
+                    alert('Erro ao remover emblema.');
+                }
+            });
         });
     });
     </script>
@@ -2278,7 +2487,7 @@ function wiredclub_send_discord_webhook(WP_Post $post): void {
         $cat_name = ($cat && !is_wp_error($cat)) ? $cat->name : '';
 
         $embed = [
-            'title'       => '### ' . ($title ?: 'Novo post'),
+            'title'       => ($title ?: 'Novo post'),
             'url'         => $post_url,
             'description' => '-# Por ' . $author_name . ' - ' . $date,
             'color'       => 16747008,
